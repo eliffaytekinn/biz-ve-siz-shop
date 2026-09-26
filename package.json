@@ -1,0 +1,14 @@
+{
+  "name": "biz-ve-siz-shop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "biz ve siz - full-stack takı mağazası (Vercel + Turso/libSQL)",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@libsql/client": "^0.18.0"
+  }
+}
