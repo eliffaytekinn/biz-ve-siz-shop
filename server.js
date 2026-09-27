@@ -2,7 +2,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { DatabaseSync } = require('node:sqlite');
+const { createClient } = require('@libsql/client');
 
 // Load local .env automatically when present. No external dotenv package needed.
 (function loadLocalEnv() {
@@ -51,9 +51,45 @@ const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30;
 const PENDING_ORDER_TTL_MS = 1000 * 60 * 60 * 2;
 
 const publicDir = __dirname;
-const db = new DatabaseSync(path.join(__dirname, 'biz-ve-siz.sqlite'));
-db.exec(`
-PRAGMA journal_mode = WAL;
+
+// Turso (libSQL) bağlantısı. TURSO_DATABASE_URL tanımlıysa uzak Turso veritabanına,
+// tanımlı değilse (yerel geliştirme) yerel bir SQLite dosyasına bağlanır — Turso hesabı
+// olmadan da `npm start` ile hiçbir ek kurulum gerekmeden çalışır.
+const db = createClient(
+  process.env.TURSO_DATABASE_URL
+    ? { url: process.env.TURSO_DATABASE_URL, authToken: process.env.TURSO_AUTH_TOKEN || undefined }
+    : { url: `file:${path.join(__dirname, 'biz-ve-siz.sqlite')}` }
+);
+
+// --- Küçük yardımcılar: node:sqlite'ın senkron prepare/get/run/all API'sine benzer,
+// ama libSQL istemcisi asenkron olduğu için await ile kullanılıyor. ---
+async function q(sql, args = []) { return db.execute({ sql, args }); }
+async function qGet(sql, args = []) { const r = await q(sql, args); return r.rows[0]; }
+async function qAll(sql, args = []) { const r = await q(sql, args); return r.rows; }
+async function qRun(sql, args = []) { return q(sql, args); } // .rowsAffected / .lastInsertRowid
+
+async function hasColumn(table, column) {
+  const rows = await qAll(`PRAGMA table_info(${table})`);
+  return rows.some(x => x.name === column);
+}
+async function addColumn(table, column, definition) {
+  if (!(await hasColumn(table, column))) await q(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+const PRODUCTS = {
+  1:{name:'Bağ Yüzüğü',price:1450,cat:'Yüzük',stock:12},
+  2:{name:'Damla Kolye',price:1980,cat:'Kolye',stock:12},
+  3:{name:'İnce Zincir Bileklik',price:1120,cat:'Bileklik',stock:15},
+  4:{name:'Sedef Küpe',price:1340,cat:'Küpe',stock:10},
+  5:{name:'Taşlı Nişan Yüzüğü',price:3200,cat:'Yüzük',stock:6},
+  6:{name:'Madalyon Kolye',price:2150,cat:'Kolye',stock:8},
+  7:{name:'Zincir Bileklik',price:990,cat:'Bileklik',stock:15},
+  8:{name:'Halka Küpe',price:1590,cat:'Küpe',stock:10}
+};
+const LAYERS={1:{name:'Choker',price:650,stock:10},2:{name:'Zincir Kolye',price:820,stock:10},3:{name:'Madalyon Kolye',price:960,stock:8}};
+
+async function initDb() {
+  await db.executeMultiple(`
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS users(
  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,19 +158,13 @@ CREATE TABLE IF NOT EXISTS coupons(
 );
 `);
 
-function hasColumn(table, column){
-  return db.prepare(`PRAGMA table_info(${table})`).all().some(x => x.name === column);
-}
-function addColumn(table, column, definition){
-  if(!hasColumn(table, column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-}
-addColumn('users', 'email_verified', 'INTEGER NOT NULL DEFAULT 0');
-addColumn('users', 'verification_token', 'TEXT');
-addColumn('users', 'verification_expires_at', 'INTEGER');
-addColumn('orders', 'coupon_code', 'TEXT');
-addColumn('orders', 'reservation_expires_at', 'INTEGER');
+  await addColumn('users', 'email_verified', 'INTEGER NOT NULL DEFAULT 0');
+  await addColumn('users', 'verification_token', 'TEXT');
+  await addColumn('users', 'verification_expires_at', 'INTEGER');
+  await addColumn('orders', 'coupon_code', 'TEXT');
+  await addColumn('orders', 'reservation_expires_at', 'INTEGER');
 
-db.exec(`
+  await db.executeMultiple(`
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
@@ -144,20 +174,10 @@ CREATE INDEX IF NOT EXISTS idx_inquiries_created ON inquiries(created_at);
 CREATE INDEX IF NOT EXISTS idx_password_resets_expires ON password_resets(expires_at);
 `);
 
-const PRODUCTS = {
-  1:{name:'Bağ Yüzüğü',price:1450,cat:'Yüzük',stock:12},
-  2:{name:'Damla Kolye',price:1980,cat:'Kolye',stock:12},
-  3:{name:'İnce Zincir Bileklik',price:1120,cat:'Bileklik',stock:15},
-  4:{name:'Sedef Küpe',price:1340,cat:'Küpe',stock:10},
-  5:{name:'Taşlı Nişan Yüzüğü',price:3200,cat:'Yüzük',stock:6},
-  6:{name:'Madalyon Kolye',price:2150,cat:'Kolye',stock:8},
-  7:{name:'Zincir Bileklik',price:990,cat:'Bileklik',stock:15},
-  8:{name:'Halka Küpe',price:1590,cat:'Küpe',stock:10}
-};
-const LAYERS={1:{name:'Choker',price:650,stock:10},2:{name:'Zincir Kolye',price:820,stock:10},3:{name:'Madalyon Kolye',price:960,stock:8}};
-for(const [id,p] of Object.entries(PRODUCTS)) db.prepare('INSERT OR IGNORE INTO inventory(product_key,stock,updated_at) VALUES(?,?,?)').run(String(id),p.stock,now());
-for(const [id,p] of Object.entries(LAYERS)) db.prepare('INSERT OR IGNORE INTO inventory(product_key,stock,updated_at) VALUES(?,?,?)').run(`layer-${id}`,p.stock,now());
-db.prepare('INSERT OR IGNORE INTO coupons(code,percent_off,max_uses,min_amount,expires_at) VALUES(?,?,?,?,?)').run('WELCOME10',10,1000,0,null);
+  for (const [id, p] of Object.entries(PRODUCTS)) await qRun('INSERT OR IGNORE INTO inventory(product_key,stock,updated_at) VALUES(?,?,?)', [String(id), p.stock, now()]);
+  for (const [id, p] of Object.entries(LAYERS)) await qRun('INSERT OR IGNORE INTO inventory(product_key,stock,updated_at) VALUES(?,?,?)', [`layer-${id}`, p.stock, now()]);
+  await qRun('INSERT OR IGNORE INTO coupons(code,percent_off,max_uses,min_amount,expires_at) VALUES(?,?,?,?,?)', ['WELCOME10', 10, 1000, 0, null]);
+}
 
 const rateBuckets = new Map();
 const RATE_RULES = {
@@ -172,6 +192,10 @@ function rateLimit(req,res,key){
   if(b.count>rule.max){ json(res,429,{error:'Çok fazla deneme yapıldı. Lütfen biraz sonra tekrar deneyin.'},{'Retry-After':String(Math.ceil((b.resetAt-nowMs)/1000))}); return false; }
   return true;
 }
+// NOT: Bu rate-limit belleği tek bir process içinde tutuluyor. Kalıcı/sürekli çalışan bir
+// sunucuda (Railway, Render, VPS) güvenilir şekilde çalışır. Vercel gibi çoklu-instance
+// serverless ortamlarda instance'lar arası paylaşılmadığı için garanti değildir — ciddi bir
+// trafik/abuse riski varsa Upstash Redis gibi paylaşılan bir store'a taşınmalıdır.
 setInterval(()=>{ const nowMs=Date.now(); for(const [k,v] of rateBuckets) if(v.resetAt<=nowMs) rateBuckets.delete(k); },10*60*1000).unref();
 
 function securityHeaders(){
@@ -196,9 +220,9 @@ function parseCookies(req){
   return out;
 }
 function cookieFlags(maxAge, httpOnly){ return `Path=/; ${httpOnly?'HttpOnly; ':''}SameSite=Lax; ${APP_URL.startsWith('https://')?'Secure; ':''}Max-Age=${maxAge}`; }
-function setSession(res,userId){
+async function setSession(res,userId){
   const token=crypto.randomBytes(32).toString('hex'); const exp=Date.now()+SESSION_TTL_MS;
-  db.prepare('INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)').run(token,userId,exp);
+  await qRun('INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)',[token,userId,exp]);
   res.setHeader('Set-Cookie',`bvs_session=${token}; ${cookieFlags(2592000,true)}`);
 }
 function setCsrfCookie(res,token){ res.setHeader('Set-Cookie',`bvs_csrf=${token}; ${cookieFlags(86400,false)}`); }
@@ -211,13 +235,13 @@ function requireCsrf(req,res){
   if(!c || !h || c.length<32 || c.length!==String(h).length || !crypto.timingSafeEqual(Buffer.from(c),Buffer.from(String(h)))){json(res,403,{error:'Güvenlik doğrulaması başarısız. Sayfayı yenileyip tekrar deneyin.'});return false;}
   return true;
 }
-function currentUser(req){
+async function currentUser(req){
   const token=parseCookies(req).bvs_session; if(!token)return null;
-  const row=db.prepare('SELECT u.id,u.name,u.email,u.email_verified,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?').get(token);
-  if(!row || row.expires_at<Date.now()){if(row)db.prepare('DELETE FROM sessions WHERE token=?').run(token);return null;} return row;
+  const row=await qGet('SELECT u.id,u.name,u.email,u.email_verified,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?',[token]);
+  if(!row || row.expires_at<Date.now()){if(row)await qRun('DELETE FROM sessions WHERE token=?',[token]);return null;} return row;
 }
-function adminUser(req){ const token=parseCookies(req).bvs_admin; if(!token)return false; const row=db.prepare('SELECT token FROM admin_sessions WHERE token=? AND expires_at>?').get(token,Date.now()); return !!row; }
-function setAdminSession(res){const token=crypto.randomBytes(32).toString('hex');db.prepare('INSERT INTO admin_sessions(token,expires_at) VALUES(?,?)').run(token,Date.now()+1000*60*60*12);res.setHeader('Set-Cookie',`bvs_admin=${token}; ${cookieFlags(43200,true)}`);}
+async function adminUser(req){ const token=parseCookies(req).bvs_admin; if(!token)return false; const row=await qGet('SELECT token FROM admin_sessions WHERE token=? AND expires_at>?',[token,Date.now()]); return !!row; }
+async function setAdminSession(res){const token=crypto.randomBytes(32).toString('hex');await qRun('INSERT INTO admin_sessions(token,expires_at) VALUES(?,?)',[token,Date.now()+1000*60*60*12]);res.setHeader('Set-Cookie',`bvs_admin=${token}; ${cookieFlags(43200,true)}`);}
 function body(req){
   return new Promise((resolve,reject)=>{let raw='';req.on('data',c=>{raw+=c;if(raw.length>1e6){reject(new Error('Payload too large'));req.destroy();}});req.on('end',()=>{try{resolve(raw?JSON.parse(raw):{});}catch(e){reject(new Error('Geçersiz JSON'));}});req.on('error',reject);});
 }
@@ -232,6 +256,13 @@ function validateIdentity(n){
 }
 function now(){return new Date().toISOString();}
 function escapeHtml(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
+// Şifre gibi gizli değerleri sabit-zamanlı karşılaştırır (uzunluk farkı bile bilgi sızdırmasın
+// diye önce sabit uzunluklu bir hash'e indirger).
+function timingSafeStringEqual(a,b){
+  const ha=crypto.createHash('sha256').update(String(a??'')).digest();
+  const hb=crypto.createHash('sha256').update(String(b??'')).digest();
+  return crypto.timingSafeEqual(ha,hb);
+}
 
 async function sendEmail({to,subject,html}){
   if(!to || !RESEND_API_KEY || !MAIL_FROM){
@@ -276,50 +307,51 @@ function normalizeItems(items){
 function inventoryRequirements(items){
   const req=new Map(); for(const item of items) for(const key of item.inventoryKeys) req.set(key,(req.get(key)||0)+item.qty); return req;
 }
-function reserveStock(items){
-  const req=inventoryRequirements(items); const tx=db;
-  tx.exec('BEGIN IMMEDIATE');
+async function reserveStock(items){
+  const req=inventoryRequirements(items);
+  const tx=await db.transaction('write');
   try{
-    for(const [key,qty] of req){const row=tx.prepare('SELECT stock FROM inventory WHERE product_key=?').get(key);if(!row || row.stock<qty)throw new Error(`Stok yetersiz: ${PRODUCTS[Number(key)]?.name || LAYERS[Number(String(key).replace('layer-',''))]?.name || key}`);}
-    for(const [key,qty] of req)tx.prepare('UPDATE inventory SET stock=stock-?,updated_at=? WHERE product_key=?').run(qty,now(),key);
-    tx.exec('COMMIT'); return true;
-  }catch(e){tx.exec('ROLLBACK');throw e;}
+    for(const [key,qty] of req){const row=(await tx.execute({sql:'SELECT stock FROM inventory WHERE product_key=?',args:[key]})).rows[0];if(!row || row.stock<qty)throw new Error(`Stok yetersiz: ${PRODUCTS[Number(key)]?.name || LAYERS[Number(String(key).replace('layer-',''))]?.name || key}`);}
+    for(const [key,qty] of req) await tx.execute({sql:'UPDATE inventory SET stock=stock-?,updated_at=? WHERE product_key=?',args:[qty,now(),key]});
+    await tx.commit(); return true;
+  }catch(e){await tx.rollback();throw e;}
 }
-function releaseStock(items){
-  const req=inventoryRequirements(items); const tx=db; tx.exec('BEGIN IMMEDIATE');
-  try{for(const [key,qty] of req)tx.prepare('UPDATE inventory SET stock=stock+?,updated_at=? WHERE product_key=?').run(qty,now(),key);tx.exec('COMMIT');}catch(e){tx.exec('ROLLBACK');throw e;}
+async function releaseStock(items){
+  const req=inventoryRequirements(items);
+  const tx=await db.transaction('write');
+  try{for(const [key,qty] of req) await tx.execute({sql:'UPDATE inventory SET stock=stock+?,updated_at=? WHERE product_key=?',args:[qty,now(),key]});await tx.commit();}catch(e){await tx.rollback();throw e;}
 }
-function finalizePendingOrder(orderId, newStatus, items){
-  const tx=db; tx.exec('BEGIN IMMEDIATE');
+async function finalizePendingOrder(orderId, newStatus, items){
+  const tx=await db.transaction('write');
   try{
-    const row=tx.prepare('SELECT status FROM orders WHERE id=?').get(orderId);
-    if(!row || row.status!=='PENDING'){tx.exec('ROLLBACK');return false;}
+    const row=(await tx.execute({sql:'SELECT status FROM orders WHERE id=?',args:[orderId]})).rows[0];
+    if(!row || row.status!=='PENDING'){await tx.rollback();return false;}
     const req=inventoryRequirements(items);
-    for(const [key,qty] of req) tx.prepare('UPDATE inventory SET stock=stock+?,updated_at=? WHERE product_key=?').run(qty,now(),key);
-    tx.prepare("UPDATE orders SET status=?,reservation_expires_at=NULL WHERE id=? AND status='PENDING'").run(newStatus,orderId);
-    tx.exec('COMMIT'); return true;
-  }catch(e){tx.exec('ROLLBACK');throw e;}
+    for(const [key,qty] of req) await tx.execute({sql:'UPDATE inventory SET stock=stock+?,updated_at=? WHERE product_key=?',args:[qty,now(),key]});
+    await tx.execute({sql:"UPDATE orders SET status=?,reservation_expires_at=NULL WHERE id=? AND status='PENDING'",args:[newStatus,orderId]});
+    await tx.commit(); return true;
+  }catch(e){await tx.rollback();throw e;}
 }
-function deletePendingOrderAndRelease(orderId,items){
-  const tx=db; tx.exec('BEGIN IMMEDIATE');
+async function deletePendingOrderAndRelease(orderId,items){
+  const tx=await db.transaction('write');
   try{
-    const row=tx.prepare('SELECT status FROM orders WHERE id=?').get(orderId);
-    if(!row || row.status!=='PENDING'){tx.exec('ROLLBACK');return false;}
+    const row=(await tx.execute({sql:'SELECT status FROM orders WHERE id=?',args:[orderId]})).rows[0];
+    if(!row || row.status!=='PENDING'){await tx.rollback();return false;}
     const req=inventoryRequirements(items);
-    for(const [key,qty] of req) tx.prepare('UPDATE inventory SET stock=stock+?,updated_at=? WHERE product_key=?').run(qty,now(),key);
-    tx.prepare("DELETE FROM orders WHERE id=? AND status='PENDING'").run(orderId);
-    tx.exec('COMMIT'); return true;
-  }catch(e){tx.exec('ROLLBACK');throw e;}
+    for(const [key,qty] of req) await tx.execute({sql:'UPDATE inventory SET stock=stock+?,updated_at=? WHERE product_key=?',args:[qty,now(),key]});
+    await tx.execute({sql:"DELETE FROM orders WHERE id=? AND status='PENDING'",args:[orderId]});
+    await tx.commit(); return true;
+  }catch(e){await tx.rollback();throw e;}
 }
 
-function cleanupExpiredReservations(){
-  const cutoff=Date.now(); const rows=db.prepare("SELECT * FROM orders WHERE status='PENDING' AND reservation_expires_at IS NOT NULL AND reservation_expires_at<?").all(cutoff);
-  for(const order of rows){try{if(finalizePendingOrder(order.id,'EXPIRED',JSON.parse(order.items_json)))console.log(`[stock] released expired order ${order.id}`);}catch(e){logError(`stock cleanup order ${order.id}`,e);}}
+async function cleanupExpiredReservations(){
+  const cutoff=Date.now(); const rows=await qAll("SELECT * FROM orders WHERE status='PENDING' AND reservation_expires_at IS NOT NULL AND reservation_expires_at<?",[cutoff]);
+  for(const order of rows){try{if(await finalizePendingOrder(order.id,'EXPIRED',JSON.parse(order.items_json)))console.log(`[stock] released expired order ${order.id}`);}catch(e){logError(`stock cleanup order ${order.id}`,e);}}
 }
-setInterval(()=>{try{db.prepare('DELETE FROM sessions WHERE expires_at<?').run(Date.now());db.prepare('DELETE FROM admin_sessions WHERE expires_at<?').run(Date.now());db.prepare('DELETE FROM password_resets WHERE expires_at<? OR used_at IS NOT NULL').run(Date.now());cleanupExpiredReservations();}catch(e){logError('maintenance cleanup',e);}},5*60*1000).unref();
+setInterval(()=>{(async()=>{try{await qRun('DELETE FROM sessions WHERE expires_at<?',[Date.now()]);await qRun('DELETE FROM admin_sessions WHERE expires_at<?',[Date.now()]);await qRun('DELETE FROM password_resets WHERE expires_at<? OR used_at IS NOT NULL',[Date.now()]);await cleanupExpiredReservations();}catch(e){logError('maintenance cleanup',e);}})();},5*60*1000).unref();
 
-function couponFor(code,amount){
-  if(!code)return null; const row=db.prepare('SELECT * FROM coupons WHERE code=?').get(String(code).trim().toUpperCase()); if(!row)return null;
+async function couponFor(code,amount){
+  if(!code)return null; const row=await qGet('SELECT * FROM coupons WHERE code=?',[String(code).trim().toUpperCase()]); if(!row)return null;
   if(row.expires_at && row.expires_at<Date.now())return null; if(row.max_uses!==null && row.used_count>=row.max_uses)return null; if(amount<row.min_amount)return null; return row;
 }
 
@@ -327,13 +359,13 @@ async function handle(req,res){
   const u=new URL(req.url,APP_URL);
   // CSRF bootstrap
   if(req.method==='GET' && u.pathname==='/api/auth/csrf'){const token=csrfToken(req,res);return json(res,200,{token});}
-  if(req.method==='GET' && u.pathname==='/api/auth/me'){const user=currentUser(req);if(!user)return json(res,401,{error:'Giriş yapılmamış.'});return json(res,200,{id:user.id,name:user.name,email:user.email,emailVerified:!!user.email_verified});}
+  if(req.method==='GET' && u.pathname==='/api/auth/me'){const user=await currentUser(req);if(!user)return json(res,401,{error:'Giriş yapılmamış.'});return json(res,200,{id:user.id,name:user.name,email:user.email,emailVerified:!!user.email_verified});}
   if(req.method==='GET' && u.pathname==='/api/catalog'){
-    const rows=db.prepare('SELECT product_key,stock FROM inventory').all(); const stock=Object.fromEntries(rows.map(r=>[r.product_key,r.stock])); return json(res,200,{products:Object.entries(PRODUCTS).map(([id,p])=>({id:Number(id),...p,stock:stock[id]??0})),layers:Object.entries(LAYERS).map(([id,p])=>({id:Number(id),...p,stock:stock[`layer-${id}`]??0}))});
+    const rows=await qAll('SELECT product_key,stock FROM inventory'); const stock=Object.fromEntries(rows.map(r=>[r.product_key,r.stock])); return json(res,200,{products:Object.entries(PRODUCTS).map(([id,p])=>({id:Number(id),...p,stock:stock[id]??0})),layers:Object.entries(LAYERS).map(([id,p])=>({id:Number(id),...p,stock:stock[`layer-${id}`]??0}))});
   }
   if(req.method==='GET' && u.pathname==='/api/orders'){
-    const user=currentUser(req);if(!user)return json(res,401,{error:'Giriş yapılmamış.'});
-    const rows=db.prepare('SELECT id,status,amount,currency,customer_name,items_json,coupon_code,created_at,paid_at FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 50').all(user.id);
+    const user=await currentUser(req);if(!user)return json(res,401,{error:'Giriş yapılmamış.'});
+    const rows=await qAll('SELECT id,status,amount,currency,customer_name,items_json,coupon_code,created_at,paid_at FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 50',[user.id]);
     return json(res,200,{orders:rows.map(o=>({...o,items:JSON.parse(o.items_json)}))});
   }
   if(req.method==='POST' && u.pathname==='/api/auth/register'){
@@ -343,72 +375,72 @@ async function handle(req,res){
       if(name.length<2||!validEmail(email)||password.length<8)return json(res,400,{error:'Ad, geçerli e-posta ve en az 8 karakterli şifre gerekli.'});
       const salt=crypto.randomBytes(16).toString('hex'),hash=passwordHash(password,salt);let verificationToken=null,verificationExpires=null;
       if(REQUIRE_EMAIL_VERIFICATION){verificationToken=crypto.randomBytes(32).toString('hex');verificationExpires=Date.now()+1000*60*60*24;}
-      const result=db.prepare('INSERT INTO users(name,email,password_hash,salt,created_at,email_verified,verification_token,verification_expires_at) VALUES(?,?,?,?,?,?,?,?)').run(name,email,hash,salt,now(),REQUIRE_EMAIL_VERIFICATION?0:1,verificationToken,verificationExpires);
+      const result=await qRun('INSERT INTO users(name,email,password_hash,salt,created_at,email_verified,verification_token,verification_expires_at) VALUES(?,?,?,?,?,?,?,?)',[name,email,hash,salt,now(),REQUIRE_EMAIL_VERIFICATION?0:1,verificationToken,verificationExpires]);
       if(REQUIRE_EMAIL_VERIFICATION){const link=`${APP_URL}/api/auth/verify-email?token=${verificationToken}`;await sendEmail({to:email,subject:'biz ve siz e-posta doğrulama',html:`<p>Merhaba ${escapeHtml(name)},</p><p>Hesabınızı doğrulamak için <a href="${link}">bu bağlantıya tıklayın</a>.</p>`});return json(res,201,{message:'Hesabınız oluşturuldu. E-posta adresinizi doğrulamak için gelen kutunuzu kontrol edin.'});}
-      setSession(res,Number(result.lastInsertRowid));return json(res,201,{message:'Hesabınız oluşturuldu ve giriş yapıldı.'});
-    }catch(e){logError('auth/register',e);return json(res,400,{error:e.code==='SQLITE_CONSTRAINT_UNIQUE'?'Bu e-posta zaten kayıtlı.':'Kayıt oluşturulamadı.'});}
+      await setSession(res,Number(result.lastInsertRowid));return json(res,201,{message:'Hesabınız oluşturuldu ve giriş yapıldı.'});
+    }catch(e){logError('auth/register',e);const isUnique=String(e.code||'').includes('CONSTRAINT')||/unique/i.test(e.message||'');return json(res,400,{error:isUnique?'Bu e-posta zaten kayıtlı.':'Kayıt oluşturulamadı.'});}
   }
   if(req.method==='GET' && u.pathname==='/api/auth/verify-email'){
-    try{const token=u.searchParams.get('token');const row=db.prepare('SELECT * FROM users WHERE verification_token=?').get(token);if(!row||!row.verification_expires_at||row.verification_expires_at<Date.now())return redirect(res,`${APP_URL}/?verified=failed`);db.prepare('UPDATE users SET email_verified=1,verification_token=NULL,verification_expires_at=NULL WHERE id=?').run(row.id);setSession(res,row.id);return redirect(res,`${APP_URL}/?verified=success`);}catch(e){logError('auth/verify-email',e);return redirect(res,`${APP_URL}/?verified=failed`);}
+    try{const token=u.searchParams.get('token');const row=await qGet('SELECT * FROM users WHERE verification_token=?',[token]);if(!row||!row.verification_expires_at||row.verification_expires_at<Date.now())return redirect(res,`${APP_URL}/?verified=failed`);await qRun('UPDATE users SET email_verified=1,verification_token=NULL,verification_expires_at=NULL WHERE id=?',[row.id]);await setSession(res,row.id);return redirect(res,`${APP_URL}/?verified=success`);}catch(e){logError('auth/verify-email',e);return redirect(res,`${APP_URL}/?verified=failed`);}
   }
   if(req.method==='POST' && u.pathname==='/api/auth/login'){
     if(!rateLimit(req,res,'login')||!requireCsrf(req,res))return;
-    try{const b=await body(req),email=String(b.email||'').trim().toLowerCase(),password=String(b.password||'');const row=db.prepare('SELECT * FROM users WHERE email=?').get(email);if(!row)return json(res,401,{error:'E-posta veya şifre hatalı.'});if(REQUIRE_EMAIL_VERIFICATION&&!row.email_verified)return json(res,403,{error:'Önce e-posta adresinizi doğrulayın.'});const hash=passwordHash(password,row.salt);if(!crypto.timingSafeEqual(Buffer.from(hash,'hex'),Buffer.from(row.password_hash,'hex')))return json(res,401,{error:'E-posta veya şifre hatalı.'});setSession(res,row.id);return json(res,200,{message:'Giriş yapıldı.',name:row.name});}catch(e){logError('auth/login',e);return json(res,400,{error:'Giriş yapılamadı.'});}
+    try{const b=await body(req),email=String(b.email||'').trim().toLowerCase(),password=String(b.password||'');const row=await qGet('SELECT * FROM users WHERE email=?',[email]);if(!row)return json(res,401,{error:'E-posta veya şifre hatalı.'});if(REQUIRE_EMAIL_VERIFICATION&&!row.email_verified)return json(res,403,{error:'Önce e-posta adresinizi doğrulayın.'});const hash=passwordHash(password,row.salt);if(!crypto.timingSafeEqual(Buffer.from(hash,'hex'),Buffer.from(row.password_hash,'hex')))return json(res,401,{error:'E-posta veya şifre hatalı.'});await setSession(res,row.id);return json(res,200,{message:'Giriş yapıldı.',name:row.name});}catch(e){logError('auth/login',e);return json(res,400,{error:'Giriş yapılamadı.'});}
   }
   if(req.method==='POST' && u.pathname==='/api/auth/logout'){
-    if(!requireCsrf(req,res))return; const token=parseCookies(req).bvs_session;if(token)db.prepare('DELETE FROM sessions WHERE token=?').run(token);return json(res,200,{message:'Çıkış yapıldı.'},{'Set-Cookie':`bvs_session=; ${cookieFlags(0,true)}`});
+    if(!requireCsrf(req,res))return; const token=parseCookies(req).bvs_session;if(token)await qRun('DELETE FROM sessions WHERE token=?',[token]);return json(res,200,{message:'Çıkış yapıldı.'},{'Set-Cookie':`bvs_session=; ${cookieFlags(0,true)}`});
   }
   if(req.method==='POST' && u.pathname==='/api/auth/forgot-password'){
-    if(!rateLimit(req,res,'login')||!requireCsrf(req,res))return; try{const b=await body(req),email=String(b.email||'').trim().toLowerCase(),row=db.prepare('SELECT id,name FROM users WHERE email=?').get(email);if(row){const token=crypto.randomBytes(32).toString('hex');db.prepare('INSERT INTO password_resets(token,user_id,expires_at) VALUES(?,?,?)').run(token,row.id,Date.now()+1000*60*30);const link=`${APP_URL}/?reset=${token}`;await sendEmail({to:email,subject:'biz ve siz şifre yenileme',html:`<p>Merhaba ${escapeHtml(row.name)},</p><p>Şifrenizi yenilemek için <a href="${link}">bu bağlantıyı kullanın</a>. Bağlantı 30 dakika geçerlidir.</p>`});if(!RESEND_API_KEY&&!IS_PRODUCTION)console.log(`[password-reset-dev] ${link}`);}return json(res,200,{message:'Eğer bu e-posta kayıtlıysa şifre yenileme bağlantısı gönderildi.'});}catch(e){logError('auth/forgot-password',e);return json(res,200,{message:'Eğer bu e-posta kayıtlıysa şifre yenileme bağlantısı gönderildi.'});}
+    if(!rateLimit(req,res,'login')||!requireCsrf(req,res))return; try{const b=await body(req),email=String(b.email||'').trim().toLowerCase(),row=await qGet('SELECT id,name FROM users WHERE email=?',[email]);if(row){const token=crypto.randomBytes(32).toString('hex');await qRun('INSERT INTO password_resets(token,user_id,expires_at) VALUES(?,?,?)',[token,row.id,Date.now()+1000*60*30]);const link=`${APP_URL}/?reset=${token}`;await sendEmail({to:email,subject:'biz ve siz şifre yenileme',html:`<p>Merhaba ${escapeHtml(row.name)},</p><p>Şifrenizi yenilemek için <a href="${link}">bu bağlantıyı kullanın</a>. Bağlantı 30 dakika geçerlidir.</p>`});if(!RESEND_API_KEY&&!IS_PRODUCTION)console.log(`[password-reset-dev] ${link}`);}return json(res,200,{message:'Eğer bu e-posta kayıtlıysa şifre yenileme bağlantısı gönderildi.'});}catch(e){logError('auth/forgot-password',e);return json(res,200,{message:'Eğer bu e-posta kayıtlıysa şifre yenileme bağlantısı gönderildi.'});}
   }
   if(req.method==='POST' && u.pathname==='/api/auth/reset-password'){
-    if(!rateLimit(req,res,'login')||!requireCsrf(req,res))return;try{const b=await body(req),token=String(b.token||''),password=String(b.password||'');if(password.length<8)return json(res,400,{error:'Şifre en az 8 karakter olmalı.'});const row=db.prepare('SELECT * FROM password_resets WHERE token=? AND used_at IS NULL AND expires_at>?').get(token,Date.now());if(!row)return json(res,400,{error:'Geçersiz veya süresi dolmuş bağlantı.'});const salt=crypto.randomBytes(16).toString('hex'),hash=passwordHash(password,salt);db.prepare('UPDATE users SET password_hash=?,salt=? WHERE id=?').run(hash,salt,row.user_id);db.prepare('UPDATE password_resets SET used_at=? WHERE token=?').run(Date.now(),token);db.prepare('DELETE FROM sessions WHERE user_id=?').run(row.user_id);return json(res,200,{message:'Şifreniz yenilendi. Yeni şifrenizle giriş yapabilirsiniz.'});}catch(e){logError('auth/reset-password',e);return json(res,400,{error:'Şifre yenilenemedi.'});}
+    if(!rateLimit(req,res,'login')||!requireCsrf(req,res))return;try{const b=await body(req),token=String(b.token||''),password=String(b.password||'');if(password.length<8)return json(res,400,{error:'Şifre en az 8 karakter olmalı.'});const row=await qGet('SELECT * FROM password_resets WHERE token=? AND used_at IS NULL AND expires_at>?',[token,Date.now()]);if(!row)return json(res,400,{error:'Geçersiz veya süresi dolmuş bağlantı.'});const salt=crypto.randomBytes(16).toString('hex'),hash=passwordHash(password,salt);await qRun('UPDATE users SET password_hash=?,salt=? WHERE id=?',[hash,salt,row.user_id]);await qRun('UPDATE password_resets SET used_at=? WHERE token=?',[Date.now(),token]);await qRun('DELETE FROM sessions WHERE user_id=?',[row.user_id]);return json(res,200,{message:'Şifreniz yenilendi. Yeni şifrenizle giriş yapabilirsiniz.'});}catch(e){logError('auth/reset-password',e);return json(res,400,{error:'Şifre yenilenemedi.'});}
   }
   if(req.method==='POST' && u.pathname==='/api/inquiries'){
-    if(!rateLimit(req,res,'inquiry')||!requireCsrf(req,res))return;try{const b=await body(req),type=['contact','special'].includes(b.type)?b.type:'contact',name=String(b.name||'').trim(),email=String(b.email||'').trim(),message=String(b.message||'').trim();if(name.length<2||!validEmail(email)||message.length<3)return json(res,400,{error:'Form alanlarını kontrol edin.'});db.prepare('INSERT INTO inquiries(type,name,email,message,created_at) VALUES(?,?,?,?,?)').run(type,name,email,message,now());if(STORE_EMAIL)await sendEmail({to:STORE_EMAIL,subject:`biz ve siz yeni ${type==='special'?'özel sipariş':'iletişim'} talebi`,html:`<p><strong>${escapeHtml(name)}</strong> (${escapeHtml(email)})</p><p>${escapeHtml(message)}</p>`});return json(res,201,{message:'Talebiniz kaydedildi.'});}catch(e){logError('inquiries',e);return json(res,400,{error:'Talep kaydedilemedi.'});}
+    if(!rateLimit(req,res,'inquiry')||!requireCsrf(req,res))return;try{const b=await body(req),type=['contact','special'].includes(b.type)?b.type:'contact',name=String(b.name||'').trim(),email=String(b.email||'').trim(),message=String(b.message||'').trim();if(name.length<2||!validEmail(email)||message.length<3)return json(res,400,{error:'Form alanlarını kontrol edin.'});await qRun('INSERT INTO inquiries(type,name,email,message,created_at) VALUES(?,?,?,?,?)',[type,name,email,message,now()]);if(STORE_EMAIL)await sendEmail({to:STORE_EMAIL,subject:`biz ve siz yeni ${type==='special'?'özel sipariş':'iletişim'} talebi`,html:`<p><strong>${escapeHtml(name)}</strong> (${escapeHtml(email)})</p><p>${escapeHtml(message)}</p>`});return json(res,201,{message:'Talebiniz kaydedildi.'});}catch(e){logError('inquiries',e);return json(res,400,{error:'Talep kaydedilemedi.'});}
   }
   if(req.method==='POST' && u.pathname==='/api/coupons/validate'){
-    if(!rateLimit(req,res,'coupon')||!requireCsrf(req,res))return;try{const b=await body(req),amount=Math.max(0,Math.round(Number(b.amount)||0)),code=String(b.code||'').trim().toUpperCase(),row=couponFor(code,amount);if(!row)return json(res,400,{error:'Kupon geçersiz, süresi dolmuş veya koşulları karşılamıyor.'});const discount=Math.floor(amount*row.percent_off/100);return json(res,200,{code:row.code,percentOff:row.percent_off,discount,total:amount-discount});}catch(e){logError('coupons/validate',e);return json(res,400,{error:'Kupon doğrulanamadı.'});}
+    if(!rateLimit(req,res,'coupon')||!requireCsrf(req,res))return;try{const b=await body(req),amount=Math.max(0,Math.round(Number(b.amount)||0)),code=String(b.code||'').trim().toUpperCase(),row=await couponFor(code,amount);if(!row)return json(res,400,{error:'Kupon geçersiz, süresi dolmuş veya koşulları karşılamıyor.'});const discount=Math.floor(amount*row.percent_off/100);return json(res,200,{code:row.code,percentOff:row.percent_off,discount,total:amount-discount});}catch(e){logError('coupons/validate',e);return json(res,400,{error:'Kupon doğrulanamadı.'});}
   }
   if(req.method==='POST' && u.pathname==='/api/payment/initialize'){
     if(!rateLimit(req,res,'payment')||!requireCsrf(req,res))return;
     let reservedItems=null, orderId=null;
     try{
       if(!IYZICO_API_KEY||!IYZICO_SECRET_KEY)return json(res,503,{error:'Ödeme sağlayıcısı henüz yapılandırılmadı. Sunucuda IYZICO_API_KEY ve IYZICO_SECRET_KEY tanımlanmalı.'});
-      const b=await body(req),items=normalizeItems(b.items),subtotal=items.reduce((sum,x)=>sum+x.price*x.qty,0),coupon=couponFor(b.couponCode,subtotal),discount=coupon?Math.floor(subtotal*coupon.percent_off/100):0,amount=subtotal-discount;
+      const b=await body(req),items=normalizeItems(b.items),subtotal=items.reduce((sum,x)=>sum+x.price*x.qty,0),coupon=await couponFor(b.couponCode,subtotal),discount=coupon?Math.floor(subtotal*coupon.percent_off/100):0,amount=subtotal-discount;
       const email=String(b.email||'').trim().toLowerCase();if(!validEmail(email))return json(res,400,{error:'Geçerli e-posta girin.'});
       if(!validateIdentity(b.identityNumber))return json(res,400,{error:'Geçerli 11 haneli T.C. Kimlik No gerekli.'});
       const conversationId=crypto.randomUUID(),buyerName=String(b.name||'').trim(),surname=String(b.surname||'').trim(),address=String(b.address||'').trim(),city=String(b.city||'').trim(),zipCode=String(b.zipCode||'').trim(),gsm=String(b.gsmNumber||'').trim();
       if(!buyerName||!surname||!address||!city||!zipCode||!gsm)return json(res,400,{error:'Teslimat bilgilerini eksiksiz doldurun.'});
-      reservedItems=items;reserveStock(items);const user=currentUser(req);const basketItems=items.map(x=>({id:x.id,price:(x.price*x.qty).toFixed(2),name:x.name,category1:x.category,itemType:x.itemType}));
-      const orderResult=db.prepare('INSERT INTO orders(user_id,conversation_id,status,amount,currency,customer_email,customer_name,address_json,items_json,coupon_code,created_at,reservation_expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(user?user.id:null,conversationId,'PENDING',amount,'TRY',email,`${buyerName} ${surname}`,JSON.stringify({address,city,zipCode,gsm}),JSON.stringify(items),coupon?.code||null,now(),Date.now()+PENDING_ORDER_TTL_MS);orderId=Number(orderResult.lastInsertRowid);
+      reservedItems=items;await reserveStock(items);const user=await currentUser(req);const basketItems=items.map(x=>({id:x.id,price:(x.price*x.qty).toFixed(2),name:x.name,category1:x.category,itemType:x.itemType}));
+      const orderResult=await qRun('INSERT INTO orders(user_id,conversation_id,status,amount,currency,customer_email,customer_name,address_json,items_json,coupon_code,created_at,reservation_expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',[user?user.id:null,conversationId,'PENDING',amount,'TRY',email,`${buyerName} ${surname}`,JSON.stringify({address,city,zipCode,gsm}),JSON.stringify(items),coupon?.code||null,now(),Date.now()+PENDING_ORDER_TTL_MS]);orderId=Number(orderResult.lastInsertRowid);
       const payload={locale:'tr',conversationId,price:amount.toFixed(2),paidPrice:amount.toFixed(2),currency:'TRY',basketId:conversationId,paymentGroup:'PRODUCT',callbackUrl:`${APP_URL}/api/payment/callback`,enabledInstallments:[1,2,3,6,9],buyer:{id:user?String(user.id):`guest-${conversationId.slice(0,8)}`,name:buyerName,surname,identityNumber:String(b.identityNumber),email,gsmNumber:gsm,registrationAddress:address,city,country:'Turkey',zipCode,ip:req.socket.remoteAddress||'127.0.0.1'},shippingAddress:{address,zipCode,contactName:`${buyerName} ${surname}`,city,country:'Turkey'},billingAddress:{address,zipCode,contactName:`${buyerName} ${surname}`,city,country:'Turkey'},basketItems};
-      const data=await iyzicoPost('/payment/iyzipos/checkoutform/initialize/auth/ecom',payload);if(!data.paymentPageUrl||!data.token)throw new Error('Ödeme sayfası oluşturulamadı.');db.prepare('UPDATE orders SET iyzico_token=? WHERE id=?').run(data.token,orderId);return json(res,200,{paymentPageUrl:data.paymentPageUrl,token:data.token,discount});
-    }catch(e){logError('payment/initialize',e);if(res.writableEnded)return;if(orderId&&reservedItems){try{deletePendingOrderAndRelease(orderId,reservedItems);}catch(err){logError('payment atomic rollback',err);}}return json(res,400,{error:e.message||'Ödeme başlatılamadı.'});}
+      const data=await iyzicoPost('/payment/iyzipos/checkoutform/initialize/auth/ecom',payload);if(!data.paymentPageUrl||!data.token)throw new Error('Ödeme sayfası oluşturulamadı.');await qRun('UPDATE orders SET iyzico_token=? WHERE id=?',[data.token,orderId]);return json(res,200,{paymentPageUrl:data.paymentPageUrl,token:data.token,discount});
+    }catch(e){logError('payment/initialize',e);if(res.writableEnded)return;if(orderId&&reservedItems){try{await deletePendingOrderAndRelease(orderId,reservedItems);}catch(err){logError('payment atomic rollback',err);}}return json(res,400,{error:e.message||'Ödeme başlatılamadı.'});}
   }
   if(req.method==='POST' && u.pathname==='/api/payment/callback'){
     try{
-      const f=await formBody(req),token=f.get('token');if(!token)return redirect(res,`${APP_URL}/?payment=failed`);const order=db.prepare('SELECT * FROM orders WHERE iyzico_token=?').get(token);if(!order)return redirect(res,`${APP_URL}/?payment=failed`);if(order.status==='PAID')return redirect(res,`${APP_URL}/?payment=success&order=${order.id}`);
+      const f=await formBody(req),token=f.get('token');if(!token)return redirect(res,`${APP_URL}/?payment=failed`);const order=await qGet('SELECT * FROM orders WHERE iyzico_token=?',[token]);if(!order)return redirect(res,`${APP_URL}/?payment=failed`);if(order.status==='PAID')return redirect(res,`${APP_URL}/?payment=success&order=${order.id}`);
       const data=await iyzicoPost('/payment/iyzipos/checkoutform/auth/ecom/detail',{locale:'tr',conversationId:order.conversation_id,token});
       if(data.paymentStatus==='SUCCESS'&&Number(data.fraudStatus)===1){
-        const tx=db;tx.exec('BEGIN IMMEDIATE');let changed=false;try{const r=tx.prepare("UPDATE orders SET status='PAID',payment_id=?,paid_at=?,reservation_expires_at=NULL WHERE id=? AND status='PENDING'").run(data.paymentId||null,now(),order.id);changed=r.changes===1;if(changed&&order.coupon_code)tx.prepare('UPDATE coupons SET used_count=used_count+1 WHERE code=?').run(order.coupon_code);tx.exec('COMMIT');}catch(e){tx.exec('ROLLBACK');throw e;}
+        const tx=await db.transaction('write');let changed=false;try{const r=await tx.execute({sql:"UPDATE orders SET status='PAID',payment_id=?,paid_at=?,reservation_expires_at=NULL WHERE id=? AND status='PENDING'",args:[data.paymentId||null,now(),order.id]});changed=r.rowsAffected===1;if(changed&&order.coupon_code)await tx.execute({sql:'UPDATE coupons SET used_count=used_count+1 WHERE code=?',args:[order.coupon_code]});await tx.commit();}catch(e){await tx.rollback();throw e;}
         if(changed){await sendOrderEmails(order,data.paymentId||null);return redirect(res,`${APP_URL}/?payment=success&order=${order.id}`);}
         return redirect(res,`${APP_URL}/?payment=success&order=${order.id}`);
       }
-      if(order.status==='PENDING'){try{finalizePendingOrder(order.id,data.paymentStatus==='SUCCESS'?'REVIEW':'FAILED',JSON.parse(order.items_json));}catch(e){logError(`payment callback stock rollback ${order.id}`,e);}}return redirect(res,`${APP_URL}/?payment=failed`);
+      if(order.status==='PENDING'){try{await finalizePendingOrder(order.id,data.paymentStatus==='SUCCESS'?'REVIEW':'FAILED',JSON.parse(order.items_json));}catch(e){logError(`payment callback stock rollback ${order.id}`,e);}}return redirect(res,`${APP_URL}/?payment=failed`);
     }catch(e){logError('payment/callback',e);return redirect(res,`${APP_URL}/?payment=failed`);}
   }
   if(req.method==='POST' && u.pathname==='/api/admin/login'){
-    if(!rateLimit(req,res,'admin')||!requireCsrf(req,res))return;try{if(!ADMIN_EMAIL||!ADMIN_PASSWORD)return json(res,503,{error:'Admin hesabı sunucuda yapılandırılmadı.'});const b=await body(req),email=String(b.email||'').trim().toLowerCase(),password=String(b.password||'');if(email!==ADMIN_EMAIL||password!==ADMIN_PASSWORD)return json(res,401,{error:'Admin bilgileri hatalı.'});setAdminSession(res);return json(res,200,{message:'Admin girişi başarılı.'});}catch(e){logError('admin/login',e);return json(res,400,{error:'Admin girişi başarısız.'});}
+    if(!rateLimit(req,res,'admin')||!requireCsrf(req,res))return;try{if(!ADMIN_EMAIL||!ADMIN_PASSWORD)return json(res,503,{error:'Admin hesabı sunucuda yapılandırılmadı.'});const b=await body(req),email=String(b.email||'').trim().toLowerCase(),password=String(b.password||'');if(email!==ADMIN_EMAIL||!timingSafeStringEqual(password,ADMIN_PASSWORD))return json(res,401,{error:'Admin bilgileri hatalı.'});await setAdminSession(res);return json(res,200,{message:'Admin girişi başarılı.'});}catch(e){logError('admin/login',e);return json(res,400,{error:'Admin girişi başarısız.'});}
   }
   if(req.method==='POST' && u.pathname==='/api/admin/logout'){
-    if(!requireCsrf(req,res))return;const token=parseCookies(req).bvs_admin;if(token)db.prepare('DELETE FROM admin_sessions WHERE token=?').run(token);return json(res,200,{message:'Çıkış yapıldı.'},{'Set-Cookie':`bvs_admin=; ${cookieFlags(0,true)}`});
+    if(!requireCsrf(req,res))return;const token=parseCookies(req).bvs_admin;if(token)await qRun('DELETE FROM admin_sessions WHERE token=?',[token]);return json(res,200,{message:'Çıkış yapıldı.'},{'Set-Cookie':`bvs_admin=; ${cookieFlags(0,true)}`});
   }
   if(u.pathname.startsWith('/api/admin/')){
-    if(!adminUser(req))return json(res,401,{error:'Admin girişi gerekli.'});
-    if(req.method==='GET'&&u.pathname==='/api/admin/orders'){const status=u.searchParams.get('status');const rows=status?db.prepare('SELECT id,status,amount,currency,customer_email,customer_name,items_json,coupon_code,created_at,paid_at FROM orders WHERE status=? ORDER BY id DESC LIMIT 200').all(status):db.prepare('SELECT id,status,amount,currency,customer_email,customer_name,items_json,coupon_code,created_at,paid_at FROM orders ORDER BY id DESC LIMIT 200').all();return json(res,200,{orders:rows.map(x=>({...x,items:JSON.parse(x.items_json)}))});}
-    if(req.method==='GET'&&u.pathname==='/api/admin/inquiries'){return json(res,200,{inquiries:db.prepare('SELECT id,type,name,email,message,created_at FROM inquiries ORDER BY id DESC LIMIT 200').all()});}
-    if(req.method==='GET'&&u.pathname==='/api/admin/inventory'){return json(res,200,{inventory:db.prepare('SELECT product_key,stock,updated_at FROM inventory ORDER BY product_key').all()});}
+    if(!(await adminUser(req)))return json(res,401,{error:'Admin girişi gerekli.'});
+    if(req.method==='GET'&&u.pathname==='/api/admin/orders'){const status=u.searchParams.get('status');const rows=status?await qAll('SELECT id,status,amount,currency,customer_email,customer_name,items_json,coupon_code,created_at,paid_at FROM orders WHERE status=? ORDER BY id DESC LIMIT 200',[status]):await qAll('SELECT id,status,amount,currency,customer_email,customer_name,items_json,coupon_code,created_at,paid_at FROM orders ORDER BY id DESC LIMIT 200');return json(res,200,{orders:rows.map(x=>({...x,items:JSON.parse(x.items_json)}))});}
+    if(req.method==='GET'&&u.pathname==='/api/admin/inquiries'){return json(res,200,{inquiries:await qAll('SELECT id,type,name,email,message,created_at FROM inquiries ORDER BY id DESC LIMIT 200')});}
+    if(req.method==='GET'&&u.pathname==='/api/admin/inventory'){return json(res,200,{inventory:await qAll('SELECT product_key,stock,updated_at FROM inventory ORDER BY product_key')});}
   }
   // Static files: asynchronous filesystem calls so the event loop is not blocked.
   let file=u.pathname==='/'?'/index.html':(u.pathname==='/admin'?'/admin.html':decodeURIComponent(u.pathname));const safe=path.posix.normalize(file).replace(/^\/+/, '');const fp=path.resolve(publicDir,safe);if(fp!==path.resolve(publicDir)&&!fp.startsWith(path.resolve(publicDir)+path.sep))return json(res,403,{error:'Forbidden'});
@@ -427,4 +459,9 @@ async function sendOrderEmails(order,paymentId){
 }
 function redirect(res,location){res.writeHead(302,{...securityHeaders(),Location:location,'Cache-Control':'no-store'});res.end();}
 
-http.createServer((req,res)=>{handle(req,res).catch(e=>{logError('unhandled request',e);if(!res.headersSent)json(res,500,{error:'Sunucu hatası.'});});}).listen(PORT,()=>console.log(`biz ve siz running on ${APP_URL}`));
+initDb().then(()=>{
+  http.createServer((req,res)=>{handle(req,res).catch(e=>{logError('unhandled request',e);if(!res.headersSent)json(res,500,{error:'Sunucu hatası.'});});}).listen(PORT,()=>console.log(`biz ve siz running on ${APP_URL}`));
+}).catch(e=>{
+  console.error('[db] Veritabanı başlatılamadı:', e);
+  process.exit(1);
+});
